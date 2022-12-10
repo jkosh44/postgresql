@@ -393,3 +393,8 @@ select generate_series('2022-01-01 00:00'::timestamp,
 select * from generate_series('2020-01-01 00:00'::timestamp,
                               '2020-01-02 03:00'::timestamp,
                               '0 hour'::interval);
+
+-- test error on dangling units
+SELECT timestamp '1995-08-06 12:30:15 y';
+SET datestyle = ISO;
+SELECT timestamp 'y m s d y2001m02d04 h04mm17s34';

@@ -77,3 +77,6 @@ SELECT date_part('microsecond', TIME '2020-05-26 13:30:25.575401');
 SELECT date_part('millisecond', TIME '2020-05-26 13:30:25.575401');
 SELECT date_part('second',      TIME '2020-05-26 13:30:25.575401');
 SELECT date_part('epoch',       TIME '2020-05-26 13:30:25.575401');
+
+-- test error on dangling units
+SELECT time '12:30:15 d';

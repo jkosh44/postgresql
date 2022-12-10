@@ -2116,3 +2116,13 @@ select * from generate_series('2020-01-01 00:00'::timestamp,
                               '2020-01-02 03:00'::timestamp,
                               '0 hour'::interval);
 ERROR:  step size cannot equal zero
+-- test error on dangling units
+SELECT timestamp '1995-08-06 12:30:15 y';
+ERROR:  invalid input syntax for type timestamp: "1995-08-06 12:30:15 y"
+LINE 1: SELECT timestamp '1995-08-06 12:30:15 y';
+                         ^
+SET datestyle = ISO;
+SELECT timestamp 'y m s d y2001m02d04 h04mm17s34';
+ERROR:  invalid input syntax for type timestamp: "y m s d y2001m02d04 h04mm17s34"
+LINE 1: SELECT timestamp 'y m s d y2001m02d04 h04mm17s34';
+                         ^

@@ -1510,6 +1510,9 @@ DecodeDateTime(char **field, int *ftype, int nf,
 
 					case UNITS:
 						tmask = 0;
+						/* prevent consecutive unhandled units */
+						if (ptype != 0)
+							return DTERR_BAD_FORMAT;
 						ptype = val;
 						break;
 
@@ -1536,7 +1539,9 @@ DecodeDateTime(char **field, int *ftype, int nf,
 							 ftype[i + 1] != DTK_TIME &&
 							 ftype[i + 1] != DTK_DATE))
 							return DTERR_BAD_FORMAT;
-
+						/* prevent consecutive unhandled units */
+						if (ptype != 0)
+							return DTERR_BAD_FORMAT;
 						ptype = val;
 						break;
 
@@ -1566,6 +1571,10 @@ DecodeDateTime(char **field, int *ftype, int nf,
 			return DTERR_BAD_FORMAT;
 		fmask |= tmask;
 	}							/* end loop over fields */
+
+	/* prefix type was dangling and never handled */
+	if (ptype != 0)
+		return DTERR_BAD_FORMAT;
 
 	/* do final checking/adjustment of Y/M/D fields */
 	dterr = ValidateDate(fmask, isjulian, is2digits, bc, tm);
@@ -2368,6 +2377,9 @@ DecodeTimeOnly(char **field, int *ftype, int nf,
 
 					case UNITS:
 						tmask = 0;
+						/* prevent consecutive unhandled units */
+						if (ptype != 0)
+							return DTERR_BAD_FORMAT;
 						ptype = val;
 						break;
 
@@ -2386,6 +2398,9 @@ DecodeTimeOnly(char **field, int *ftype, int nf,
 							 ftype[i + 1] != DTK_DATE))
 							return DTERR_BAD_FORMAT;
 
+						/* prevent consecutive unhandled units */
+						if (ptype != 0)
+							return DTERR_BAD_FORMAT;
 						ptype = val;
 						break;
 
@@ -2415,6 +2430,10 @@ DecodeTimeOnly(char **field, int *ftype, int nf,
 			return DTERR_BAD_FORMAT;
 		fmask |= tmask;
 	}							/* end loop over fields */
+
+	/* prefix type was dangling and never handled */
+	if (ptype != 0)
+		return DTERR_BAD_FORMAT;
 
 	/* do final checking/adjustment of Y/M/D fields */
 	dterr = ValidateDate(fmask, isjulian, is2digits, bc, tm);

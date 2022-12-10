@@ -84,3 +84,6 @@ SELECT date_part('microsecond', TIME WITH TIME ZONE '2020-05-26 13:30:25.575401-
 SELECT date_part('millisecond', TIME WITH TIME ZONE '2020-05-26 13:30:25.575401-04');
 SELECT date_part('second',      TIME WITH TIME ZONE '2020-05-26 13:30:25.575401-04');
 SELECT date_part('epoch',       TIME WITH TIME ZONE '2020-05-26 13:30:25.575401-04');
+
+-- test error on dangling units
+SELECT timetz '12:30:15 d';

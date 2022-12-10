@@ -373,3 +373,8 @@ select make_date(2013, 13, 1);
 select make_date(2013, 11, -1);
 select make_time(10, 55, 100.1);
 select make_time(24, 0, 2.1);
+
+-- test error on dangling units
+SELECT date '1995-08-06 m';
+SET datestyle = ISO;
+SELECT date 'y m s d y2001m02d04';

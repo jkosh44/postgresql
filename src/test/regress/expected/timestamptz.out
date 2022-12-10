@@ -3091,3 +3091,13 @@ select * from tmptz where f1 at time zone 'utc' = '2017-01-18 00:00';
  Tue Jan 17 16:00:00 2017 PST
 (1 row)
 
+-- test error on dangling units
+SELECT timestamptz '1995-08-06 12:30:15 m';
+ERROR:  invalid input syntax for type timestamp with time zone: "1995-08-06 12:30:15 m"
+LINE 1: SELECT timestamptz '1995-08-06 12:30:15 m';
+                           ^
+SET datestyle = ISO;
+SELECT timestamptz 'y m s d y2001m02d04 h04mm17s34';
+ERROR:  invalid input syntax for type timestamp with time zone: "y m s d y2001m02d04 h04mm17s34"
+LINE 1: SELECT timestamptz 'y m s d y2001m02d04 h04mm17s34';
+                           ^

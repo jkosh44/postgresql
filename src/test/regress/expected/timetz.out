@@ -262,3 +262,8 @@ SELECT date_part('epoch',       TIME WITH TIME ZONE '2020-05-26 13:30:25.575401-
  63025.575401
 (1 row)
 
+-- test error on dangling units
+SELECT timetz '12:30:15 d';
+ERROR:  invalid input syntax for type time with time zone: "12:30:15 d"
+LINE 1: SELECT timetz '12:30:15 d';
+                      ^

@@ -596,3 +596,8 @@ insert into tmptz values ('2017-01-18 00:00+00');
 explain (costs off)
 select * from tmptz where f1 at time zone 'utc' = '2017-01-18 00:00';
 select * from tmptz where f1 at time zone 'utc' = '2017-01-18 00:00';
+
+-- test error on dangling units
+SELECT timestamptz '1995-08-06 12:30:15 m';
+SET datestyle = ISO;
+SELECT timestamptz 'y m s d y2001m02d04 h04mm17s34';
