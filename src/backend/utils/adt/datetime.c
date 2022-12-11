@@ -1432,6 +1432,9 @@ DecodeDateTime(char **field, int *ftype, int nf,
 								break;
 
 							default:
+								/* only allowed if we haven't already parsed some fields */
+								if (fmask)
+									return DTERR_BAD_FORMAT;
 								*dtype = val;
 						}
 
