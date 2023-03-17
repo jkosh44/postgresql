@@ -154,6 +154,15 @@ pg_mul_s32_overflow(int32 a, int32 b, int32 *result)
 #endif
 }
 
+static inline bool
+pg_mul_add_s32_overflow(int32 val, int32 multiplier, int32 *sum)
+{
+	int32		product;
+
+	return pg_mul_s32_overflow(val, multiplier, &product) ||
+		pg_add_s32_overflow(*sum, product, sum);
+}
+
 /*
  * INT64
  */
@@ -252,6 +261,15 @@ pg_mul_s64_overflow(int64 a, int64 b, int64 *result)
 	*result = a * b;
 	return false;
 #endif
+}
+
+static inline bool
+pg_mul_add_s64_overflow(int64 val, int64 multiplier, int64 *sum)
+{
+	int64		product;
+
+	return pg_mul_s64_overflow(val, multiplier, &product) ||
+		pg_add_s64_overflow(*sum, product, sum);
 }
 
 /*------------------------------------------------------------------------

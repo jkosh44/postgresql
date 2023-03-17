@@ -18,6 +18,7 @@
 #include <ctype.h>
 #include <math.h>
 #include <limits.h>
+#include <float.h>
 #include <sys/time.h>
 
 #include "access/xact.h"
@@ -79,6 +80,7 @@ static bool AdjustIntervalForTypmod(Interval *interval, int32 typmod,
 static TimestampTz timestamp2timestamptz(Timestamp timestamp);
 static Timestamp timestamptz2timestamp(TimestampTz timestamp);
 
+static void interval_um_internal(Interval *interval, Interval *result);
 
 /* common code for timestamptypmodin and timestamptztypmodin */
 static int32
@@ -924,6 +926,14 @@ interval_in(PG_FUNCTION_ARGS)
 						 errmsg("interval out of range")));
 			break;
 
+		case DTK_LATE:
+			INTERVAL_NOEND(result);
+			break;
+
+		case DTK_EARLY:
+			INTERVAL_NOBEGIN(result);
+			break;
+
 		default:
 			elog(ERROR, "unexpected dtype %d while parsing interval \"%s\"",
 				 dtype, str);
@@ -946,8 +956,13 @@ interval_out(PG_FUNCTION_ARGS)
 			   *itm = &tt;
 	char		buf[MAXDATELEN + 1];
 
-	interval2itm(*span, itm);
-	EncodeInterval(itm, IntervalStyle, buf);
+	if (INTERVAL_NOT_FINITE(span))
+		EncodeSpecialInterval(span, buf);
+	else
+	{
+		interval2itm(*span, itm);
+		EncodeInterval(itm, IntervalStyle, buf);
+	}
 
 	result = pstrdup(buf);
 	PG_RETURN_CSTRING(result);
@@ -1334,6 +1349,13 @@ AdjustIntervalForTypmod(Interval *interval, int32 typmod,
 	};
 
 	/*
+	 * Infinite interval after being subjected to typmod conversion remains
+	 * infinite.
+	 */
+	if (INTERVAL_NOT_FINITE(interval))
+		return true;
+
+	/*
 	 * Unspecified range and precision? Then not necessary to adjust. Setting
 	 * typmod to -1 is the convention for all data types.
 	 */
@@ -1501,13 +1523,35 @@ make_interval(PG_FUNCTION_ARGS)
 				 errmsg("interval out of range")));
 
 	result = (Interval *) palloc(sizeof(Interval));
-	result->month = years * MONTHS_PER_YEAR + months;
-	result->day = weeks * 7 + days;
+	result->month = months;
+	if (pg_mul_add_s32_overflow(years, MONTHS_PER_YEAR, &result->month))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
+
+	result->day = days;
+	if (pg_mul_add_s32_overflow(weeks, 7, &result->day))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
 
 	secs = rint(secs * USECS_PER_SEC);
-	result->time = hours * ((int64) SECS_PER_HOUR * USECS_PER_SEC) +
-		mins * ((int64) SECS_PER_MINUTE * USECS_PER_SEC) +
-		(int64) secs;
+
+	result->time = secs;
+	if (pg_mul_add_s64_overflow(mins, ((int64) SECS_PER_MINUTE * USECS_PER_SEC), &result->time))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
+	if (pg_mul_add_s64_overflow(hours, ((int64) SECS_PER_HOUR * USECS_PER_SEC), &result->time))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
+
+	if (INTERVAL_NOT_FINITE(result))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
+
 
 	PG_RETURN_INTERVAL_P(result);
 }
@@ -1524,6 +1568,17 @@ EncodeSpecialTimestamp(Timestamp dt, char *str)
 		strcpy(str, LATE);
 	else						/* shouldn't happen */
 		elog(ERROR, "invalid argument for EncodeSpecialTimestamp");
+}
+
+void
+EncodeSpecialInterval(Interval *interval, char *str)
+{
+	if (INTERVAL_IS_NOBEGIN(interval))
+		strcpy(str, EARLY);
+	else if (INTERVAL_IS_NOEND(interval))
+		strcpy(str, LATE);
+	else						/* shouldn't happen */
+		elog(ERROR, "invalid argument for EncodeSpecialInterval");
 }
 
 Datum
@@ -2013,6 +2068,8 @@ itm2interval(struct pg_itm *itm, Interval *span)
 	if (pg_add_s64_overflow(span->time, itm->tm_usec,
 							&span->time))
 		return -1;
+	if (INTERVAL_NOT_FINITE(span))
+		return -1;
 	return 0;
 }
 
@@ -2030,6 +2087,8 @@ itmin2interval(struct pg_itm_in *itm_in, Interval *span)
 	span->month = (int32) total_months;
 	span->day = itm_in->tm_mday;
 	span->time = itm_in->tm_usec;
+	if (INTERVAL_NOT_FINITE(span))
+		return -1;
 	return 0;
 }
 
@@ -2063,7 +2122,9 @@ timestamp_finite(PG_FUNCTION_ARGS)
 Datum
 interval_finite(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_BOOL(true);
+	Interval   *interval = PG_GETARG_INTERVAL_P(0);
+
+	PG_RETURN_BOOL(!INTERVAL_NOT_FINITE(interval));
 }
 
 
@@ -2193,6 +2254,29 @@ timestamp_fastcmp(Datum x, Datum y, SortSupport ssup)
 	return timestamp_cmp_internal(a, b);
 }
 #endif
+
+double
+interval2timestamp_no_overflow(Interval *interval)
+{
+	double		result;
+
+	if (INTERVAL_IS_NOBEGIN(interval))
+		result = -DBL_MAX;
+	else if (INTERVAL_IS_NOEND(interval))
+		result = DBL_MAX;
+	else
+	{
+		/*
+		 * Convert the month part of Interval to days using assumed average
+		 * month length of 365.25/12.0 days.  Not too accurate, but plenty
+		 * good enough for our purposes.
+		 */
+		return interval->time + interval->day * (double) USECS_PER_DAY +
+			interval->month * ((DAYS_PER_YEAR / (double) MONTHS_PER_YEAR) * USECS_PER_DAY);
+	}
+
+	return result;
+}
 
 Datum
 timestamp_sortsupport(PG_FUNCTION_ARGS)
@@ -2689,46 +2773,73 @@ timestamp_mi(PG_FUNCTION_ARGS)
 
 	result = (Interval *) palloc(sizeof(Interval));
 
-	if (TIMESTAMP_NOT_FINITE(dt1) || TIMESTAMP_NOT_FINITE(dt2))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("cannot subtract infinite timestamps")));
-
-	if (unlikely(pg_sub_s64_overflow(dt1, dt2, &result->time)))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("interval out of range")));
-
-	result->month = 0;
-	result->day = 0;
-
-	/*----------
-	 *	This is wrong, but removing it breaks a lot of regression tests.
-	 *	For example:
-	 *
-	 *	test=> SET timezone = 'EST5EDT';
-	 *	test=> SELECT
-	 *	test-> ('2005-10-30 13:22:00-05'::timestamptz -
-	 *	test(>	'2005-10-29 13:22:00-04'::timestamptz);
-	 *	?column?
-	 *	----------------
-	 *	 1 day 01:00:00
-	 *	 (1 row)
-	 *
-	 *	so adding that to the first timestamp gets:
-	 *
-	 *	 test=> SELECT
-	 *	 test-> ('2005-10-29 13:22:00-04'::timestamptz +
-	 *	 test(> ('2005-10-30 13:22:00-05'::timestamptz -
-	 *	 test(>  '2005-10-29 13:22:00-04'::timestamptz)) at time zone 'EST';
-	 *		timezone
-	 *	--------------------
-	 *	2005-10-30 14:22:00
-	 *	(1 row)
-	 *----------
+	/*
+	 * Subtracting two infinite timestamps with different signs results in an
+	 * infinite interval with the same sign as the left operand. Subtracting
+	 * two infinte timestamps with the same sign results in an error.
 	 */
-	result = DatumGetIntervalP(DirectFunctionCall1(interval_justify_hours,
-												   IntervalPGetDatum(result)));
+	if (TIMESTAMP_IS_NOBEGIN(dt1))
+	{
+		if TIMESTAMP_IS_NOBEGIN
+			(dt2)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("timestamp out of range")));
+		else
+			INTERVAL_NOBEGIN(result);
+	}
+	else if (TIMESTAMP_IS_NOEND(dt1))
+	{
+		if TIMESTAMP_IS_NOEND
+			(dt2)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("timestamp out of range")));
+		else
+			INTERVAL_NOEND(result);
+	}
+	else if (TIMESTAMP_IS_NOBEGIN(dt2))
+		INTERVAL_NOEND(result);
+	else if (TIMESTAMP_IS_NOEND(dt2))
+		INTERVAL_NOBEGIN(result);
+	else
+	{
+		if (unlikely(pg_sub_s64_overflow(dt1, dt2, &result->time)))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 	 errmsg("interval out of range")));
+
+		result->month = 0;
+		result->day = 0;
+
+		/*----------
+		 *	This is wrong, but removing it breaks a lot of regression tests.
+		 *	For example:
+		 *
+		 *	test=> SET timezone = 'EST5EDT';
+		 *	test=> SELECT
+		 *	test-> ('2005-10-30 13:22:00-05'::timestamptz -
+		 *	test(>	'2005-10-29 13:22:00-04'::timestamptz);
+		 *	?column?
+		 *	----------------
+		 *	 1 day 01:00:00
+		 *	 (1 row)
+		 *
+		 *	so adding that to the first timestamp gets:
+		 *
+		 *	 test=> SELECT
+		 *	 test-> ('2005-10-29 13:22:00-04'::timestamptz +
+		 *	 test(> ('2005-10-30 13:22:00-05'::timestamptz -
+		 *	 test(>  '2005-10-29 13:22:00-04'::timestamptz)) at time zone 'EST';
+		 *		timezone
+		 *	--------------------
+		 *	2005-10-30 14:22:00
+		 *	(1 row)
+		 *----------
+		 */
+		result = DatumGetIntervalP(DirectFunctionCall1(interval_justify_hours,
+													   IntervalPGetDatum(result)));
+	}
 
 	PG_RETURN_INTERVAL_P(result);
 }
@@ -2757,6 +2868,9 @@ interval_justify_interval(PG_FUNCTION_ARGS)
 	result->month = span->month;
 	result->day = span->day;
 	result->time = span->time;
+
+	if (INTERVAL_NOT_FINITE(result))
+		PG_RETURN_INTERVAL_P(result);
 
 	/* pre-justify days if it might prevent overflow */
 	if ((result->day > 0 && result->time > 0) ||
@@ -2810,6 +2924,11 @@ interval_justify_interval(PG_FUNCTION_ARGS)
 		result->day++;
 	}
 
+	if (INTERVAL_NOT_FINITE(result))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
+
 	PG_RETURN_INTERVAL_P(result);
 }
 
@@ -2832,6 +2951,9 @@ interval_justify_hours(PG_FUNCTION_ARGS)
 	result->month = span->month;
 	result->day = span->day;
 	result->time = span->time;
+
+	if (INTERVAL_NOT_FINITE(result))
+		PG_RETURN_INTERVAL_P(result);
 
 	TMODULO(result->time, wholeday, USECS_PER_DAY);
 	if (pg_add_s32_overflow(result->day, wholeday, &result->day))
@@ -2871,6 +2993,9 @@ interval_justify_days(PG_FUNCTION_ARGS)
 	result->day = span->day;
 	result->time = span->time;
 
+	if (INTERVAL_NOT_FINITE(result))
+		PG_RETURN_INTERVAL_P(result);
+
 	wholemonth = result->day / DAYS_PER_MONTH;
 	result->day -= wholemonth * DAYS_PER_MONTH;
 	if (pg_add_s32_overflow(result->month, wholemonth, &result->month))
@@ -2888,6 +3013,11 @@ interval_justify_days(PG_FUNCTION_ARGS)
 		result->day -= DAYS_PER_MONTH;
 		result->month++;
 	}
+
+	if (INTERVAL_NOT_FINITE(result))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
 
 	PG_RETURN_INTERVAL_P(result);
 }
@@ -2909,7 +3039,32 @@ timestamp_pl_interval(PG_FUNCTION_ARGS)
 	Interval   *span = PG_GETARG_INTERVAL_P(1);
 	Timestamp	result;
 
-	if (TIMESTAMP_NOT_FINITE(timestamp))
+	/*
+	 * Adding two infinites with the same sign results in an infinite
+	 * timestamp with the same sign. Adding two infintes with different signs
+	 * results in an error.
+	 */
+	if (INTERVAL_IS_NOBEGIN(span))
+	{
+		if TIMESTAMP_IS_NOEND
+			(timestamp)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("interval out of range")));
+		else
+			TIMESTAMP_NOBEGIN(result);
+	}
+	else if (INTERVAL_IS_NOEND(span))
+	{
+		if TIMESTAMP_IS_NOBEGIN
+			(timestamp)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("interval out of range")));
+		else
+			TIMESTAMP_NOEND(result);
+	}
+	else if (TIMESTAMP_NOT_FINITE(timestamp))
 		result = timestamp;
 	else
 	{
@@ -2988,9 +3143,7 @@ timestamp_mi_interval(PG_FUNCTION_ARGS)
 	Interval   *span = PG_GETARG_INTERVAL_P(1);
 	Interval	tspan;
 
-	tspan.month = -span->month;
-	tspan.day = -span->day;
-	tspan.time = -span->time;
+	interval_um_internal(span, &tspan);
 
 	return DirectFunctionCall2(timestamp_pl_interval,
 							   TimestampGetDatum(timestamp),
@@ -3015,7 +3168,32 @@ timestamptz_pl_interval(PG_FUNCTION_ARGS)
 	TimestampTz result;
 	int			tz;
 
-	if (TIMESTAMP_NOT_FINITE(timestamp))
+	/*
+	 * Adding two infinites with the same sign results in an infinite
+	 * timestamp with the same sign. Adding two infintes with different signs
+	 * results in an error.
+	 */
+	if (INTERVAL_IS_NOBEGIN(span))
+	{
+		if TIMESTAMP_IS_NOEND
+			(timestamp)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("interval out of range")));
+		else
+			TIMESTAMP_NOBEGIN(result);
+	}
+	else if (INTERVAL_IS_NOEND(span))
+	{
+		if TIMESTAMP_IS_NOBEGIN
+			(timestamp)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("interval out of range")));
+		else
+			TIMESTAMP_NOEND(result);
+	}
+	else if (TIMESTAMP_NOT_FINITE(timestamp))
 		result = timestamp;
 	else
 	{
@@ -3098,15 +3276,37 @@ timestamptz_mi_interval(PG_FUNCTION_ARGS)
 	Interval   *span = PG_GETARG_INTERVAL_P(1);
 	Interval	tspan;
 
-	tspan.month = -span->month;
-	tspan.day = -span->day;
-	tspan.time = -span->time;
+	interval_um_internal(span, &tspan);
 
 	return DirectFunctionCall2(timestamptz_pl_interval,
 							   TimestampGetDatum(timestamp),
 							   PointerGetDatum(&tspan));
 }
 
+/* Negates the given interval */
+static void
+interval_um_internal(Interval *interval, Interval *result)
+{
+	if (INTERVAL_IS_NOBEGIN(interval))
+		INTERVAL_NOEND(result);
+	else if (INTERVAL_IS_NOEND(interval))
+		INTERVAL_NOBEGIN(result);
+	else if (interval->time == PG_INT64_MIN || interval->day == PG_INT32_MIN || interval->month == PG_INT32_MIN)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
+	else
+	{
+		result->time = -interval->time;
+		result->day = -interval->day;
+		result->month = -interval->month;
+
+		if (INTERVAL_NOT_FINITE(result))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("interval out of range")));
+	}
+}
 
 Datum
 interval_um(PG_FUNCTION_ARGS)
@@ -3115,23 +3315,7 @@ interval_um(PG_FUNCTION_ARGS)
 	Interval   *result;
 
 	result = (Interval *) palloc(sizeof(Interval));
-
-	result->time = -interval->time;
-	/* overflow check copied from int4um */
-	if (interval->time != 0 && SAMESIGN(result->time, interval->time))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("interval out of range")));
-	result->day = -interval->day;
-	if (interval->day != 0 && SAMESIGN(result->day, interval->day))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("interval out of range")));
-	result->month = -interval->month;
-	if (interval->month != 0 && SAMESIGN(result->month, interval->month))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("interval out of range")));
+	interval_um_internal(interval, result);
 
 	PG_RETURN_INTERVAL_P(result);
 }
@@ -3175,28 +3359,62 @@ interval_pl(PG_FUNCTION_ARGS)
 
 	result = (Interval *) palloc(sizeof(Interval));
 
-	result->month = span1->month + span2->month;
-	/* overflow check copied from int4pl */
-	if (SAMESIGN(span1->month, span2->month) &&
-		!SAMESIGN(result->month, span1->month))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("interval out of range")));
+	/*
+	 * Adding two infinite intervals with the same signs results in an
+	 * infinite interval with the same sign. Adding two infinte intervals with
+	 * different signs results in an error.
+	 */
+	if (INTERVAL_IS_NOBEGIN(span1))
+	{
+		if INTERVAL_IS_NOEND
+			(span2)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("interval out of range")));
+		else
+			INTERVAL_NOBEGIN(result);
+	}
+	else if (INTERVAL_IS_NOEND(span1))
+	{
+		if INTERVAL_IS_NOBEGIN
+			(span2)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("interval out of range")));
+		else
+			INTERVAL_NOEND(result);
+	}
+	else if (INTERVAL_NOT_FINITE(span2))
+		memcpy(result, span2, sizeof(Interval));
+	else
+	{
+		result->month = span1->month + span2->month;
+		/* overflow check copied from int4pl */
+		if (SAMESIGN(span1->month, span2->month) &&
+			!SAMESIGN(result->month, span1->month))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("interval out of range")));
 
-	result->day = span1->day + span2->day;
-	if (SAMESIGN(span1->day, span2->day) &&
-		!SAMESIGN(result->day, span1->day))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("interval out of range")));
+		result->day = span1->day + span2->day;
+		if (SAMESIGN(span1->day, span2->day) &&
+			!SAMESIGN(result->day, span1->day))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("interval out of range")));
 
-	result->time = span1->time + span2->time;
-	if (SAMESIGN(span1->time, span2->time) &&
-		!SAMESIGN(result->time, span1->time))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("interval out of range")));
+		result->time = span1->time + span2->time;
+		if (SAMESIGN(span1->time, span2->time) &&
+			!SAMESIGN(result->time, span1->time))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("interval out of range")));
 
+		if (INTERVAL_NOT_FINITE(result))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("interval out of range")));
+	}
 	PG_RETURN_INTERVAL_P(result);
 }
 
@@ -3209,28 +3427,64 @@ interval_mi(PG_FUNCTION_ARGS)
 
 	result = (Interval *) palloc(sizeof(Interval));
 
-	result->month = span1->month - span2->month;
-	/* overflow check copied from int4mi */
-	if (!SAMESIGN(span1->month, span2->month) &&
-		!SAMESIGN(result->month, span1->month))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("interval out of range")));
+	/*
+	 * Subtracting two infinite intervals with different signs results in an
+	 * infinite interval with the same sign as the left operand. Subtracting
+	 * two infinte intervals with the same sign results in an error.
+	 */
+	if (INTERVAL_IS_NOBEGIN(span1))
+	{
+		if INTERVAL_IS_NOBEGIN
+			(span2)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("interval out of range")));
+		else
+			INTERVAL_NOBEGIN(result);
+	}
+	else if (INTERVAL_IS_NOEND(span1))
+	{
+		if INTERVAL_IS_NOEND
+			(span2)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("interval out of range")));
+		else
+			INTERVAL_NOEND(result);
+	}
+	else if (INTERVAL_IS_NOBEGIN(span2))
+		INTERVAL_NOEND(result);
+	else if (INTERVAL_IS_NOEND(span2))
+		INTERVAL_NOBEGIN(result);
+	else
+	{
+		result->month = span1->month - span2->month;
+		/* overflow check copied from int4mi */
+		if (!SAMESIGN(span1->month, span2->month) &&
+			!SAMESIGN(result->month, span1->month))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("interval out of range")));
 
-	result->day = span1->day - span2->day;
-	if (!SAMESIGN(span1->day, span2->day) &&
-		!SAMESIGN(result->day, span1->day))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("interval out of range")));
+		result->day = span1->day - span2->day;
+		if (!SAMESIGN(span1->day, span2->day) &&
+			!SAMESIGN(result->day, span1->day))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("interval out of range")));
 
-	result->time = span1->time - span2->time;
-	if (!SAMESIGN(span1->time, span2->time) &&
-		!SAMESIGN(result->time, span1->time))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("interval out of range")));
+		result->time = span1->time - span2->time;
+		if (!SAMESIGN(span1->time, span2->time) &&
+			!SAMESIGN(result->time, span1->time))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("interval out of range")));
 
+		if (INTERVAL_NOT_FINITE(result))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("interval out of range")));
+	}
 	PG_RETURN_INTERVAL_P(result);
 }
 
@@ -3253,6 +3507,24 @@ interval_mul(PG_FUNCTION_ARGS)
 	Interval   *result;
 
 	result = (Interval *) palloc(sizeof(Interval));
+
+	if (isnan(factor))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
+
+	/*
+	 * Multiplying infinite interval by finite number keeps it infinite but
+	 * may change the sign.
+	 */
+	if (INTERVAL_NOT_FINITE(span))
+	{
+		if (factor < 0.0)
+			interval_um_internal(span, result);
+		else
+			memcpy(result, span, sizeof(Interval));
+		PG_RETURN_INTERVAL_P(result);
+	}
 
 	result_double = span->month * factor;
 	if (isnan(result_double) ||
@@ -3314,6 +3586,11 @@ interval_mul(PG_FUNCTION_ARGS)
 				 errmsg("interval out of range")));
 	result->time = (int64) result_double;
 
+	if (INTERVAL_NOT_FINITE(result))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
+
 	PG_RETURN_INTERVAL_P(result);
 }
 
@@ -3345,6 +3622,29 @@ interval_div(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_DIVISION_BY_ZERO),
 				 errmsg("division by zero")));
 
+	if (isnan(factor))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
+
+	/*
+	 * Dividing infinite interval by finite number keeps it infinite but may
+	 * change the sign.
+	 */
+	if (INTERVAL_NOT_FINITE(span))
+	{
+		if (isinf(factor))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("interval out of range")));
+
+		if (factor < 0.0)
+			interval_um_internal(span, result);
+		else
+			memcpy(result, span, sizeof(Interval));
+		PG_RETURN_INTERVAL_P(result);
+	}
+
 	result->month = (int32) (span->month / factor);
 	result->day = (int32) (span->day / factor);
 
@@ -3365,6 +3665,11 @@ interval_div(PG_FUNCTION_ARGS)
 	/* cascade units down */
 	result->day += (int32) month_remainder_days;
 	result->time = rint(span->time / factor + sec_remainder * USECS_PER_SEC);
+
+	if (INTERVAL_NOT_FINITE(result))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
 
 	PG_RETURN_INTERVAL_P(result);
 }
@@ -3653,8 +3958,37 @@ timestamp_age(PG_FUNCTION_ARGS)
 
 	result = (Interval *) palloc(sizeof(Interval));
 
-	if (timestamp2tm(dt1, NULL, tm1, &fsec1, NULL, NULL) == 0 &&
-		timestamp2tm(dt2, NULL, tm2, &fsec2, NULL, NULL) == 0)
+	/*
+	 * Subtracting two infinite timestamps with different signs results in an
+	 * infinite interval with the same sign as the left operand. Subtracting
+	 * two infinte timestamps with the same sign results in an error.
+	 */
+	if (TIMESTAMP_IS_NOBEGIN(dt1))
+	{
+		if TIMESTAMP_IS_NOBEGIN
+			(dt2)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("timestamp out of range")));
+		else
+			INTERVAL_NOBEGIN(result);
+	}
+	else if (TIMESTAMP_IS_NOEND(dt1))
+	{
+		if TIMESTAMP_IS_NOEND
+			(dt2)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("timestamp out of range")));
+		else
+			INTERVAL_NOEND(result);
+	}
+	else if (TIMESTAMP_IS_NOBEGIN(dt2))
+		INTERVAL_NOEND(result);
+	else if (TIMESTAMP_IS_NOEND(dt2))
+		INTERVAL_NOBEGIN(result);
+	else if (timestamp2tm(dt1, NULL, tm1, &fsec1, NULL, NULL) == 0 &&
+			 timestamp2tm(dt2, NULL, tm2, &fsec2, NULL, NULL) == 0)
 	{
 		/* form the symbolic difference */
 		tm->tm_usec = fsec1 - fsec2;
@@ -3773,8 +4107,37 @@ timestamptz_age(PG_FUNCTION_ARGS)
 
 	result = (Interval *) palloc(sizeof(Interval));
 
-	if (timestamp2tm(dt1, &tz1, tm1, &fsec1, NULL, NULL) == 0 &&
-		timestamp2tm(dt2, &tz2, tm2, &fsec2, NULL, NULL) == 0)
+	/*
+	 * Subtracting two infinite timestamps with different signs results in an
+	 * infinite interval with the same sign as the left operand. Subtracting
+	 * two infinte timestamps with the same sign results in an error.
+	 */
+	if (TIMESTAMP_IS_NOBEGIN(dt1))
+	{
+		if TIMESTAMP_IS_NOBEGIN
+			(dt2)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("timestamp out of range")));
+		else
+			INTERVAL_NOBEGIN(result);
+	}
+	else if (TIMESTAMP_IS_NOEND(dt1))
+	{
+		if TIMESTAMP_IS_NOEND
+			(dt2)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						 errmsg("timestamp out of range")));
+		else
+			INTERVAL_NOEND(result);
+	}
+	else if (TIMESTAMP_IS_NOBEGIN(dt2))
+		INTERVAL_NOEND(result);
+	else if (TIMESTAMP_IS_NOEND(dt2))
+		INTERVAL_NOBEGIN(result);
+	else if (timestamp2tm(dt1, &tz1, tm1, &fsec1, NULL, NULL) == 0 &&
+			 timestamp2tm(dt2, &tz2, tm2, &fsec2, NULL, NULL) == 0)
 	{
 		/* form the symbolic difference */
 		tm->tm_usec = fsec1 - fsec2;
@@ -3898,6 +4261,11 @@ timestamp_bin(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
 				 errmsg("origin out of range")));
+
+	if (INTERVAL_NOT_FINITE(stride))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("timestamps cannot be binned into infinite intervals")));
 
 	if (stride->month != 0)
 		ereport(ERROR,
@@ -4081,6 +4449,11 @@ timestamptz_bin(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
 				 errmsg("origin out of range")));
+
+	if (INTERVAL_NOT_FINITE(stride))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("timestamps cannot be binned into infinite intervals")));
 
 	if (stride->month != 0)
 		ereport(ERROR,
@@ -4322,6 +4695,12 @@ interval_trunc(PG_FUNCTION_ARGS)
 			   *tm = &tt;
 
 	result = (Interval *) palloc(sizeof(Interval));
+
+	if (INTERVAL_NOT_FINITE(interval))
+	{
+		memcpy(result, interval, sizeof(Interval));
+		PG_RETURN_INTERVAL_P(result);
+	}
 
 	lowunits = downcase_truncate_identifier(VARDATA_ANY(units),
 											VARSIZE_ANY_EXHDR(units),
@@ -5182,6 +5561,60 @@ extract_timestamptz(PG_FUNCTION_ARGS)
 }
 
 
+/*
+ * NonFiniteIntervalPart
+ *
+ *	Used by interval_part when extracting from infinite
+ *	interval.  Returns +/-Infinity if that is the appropriate result,
+ *	otherwise returns zero (which should be taken as meaning to return NULL).
+ *
+ *	Errors thrown here for invalid units should exactly match those that
+ *	would be thrown in the calling functions, else there will be unexpected
+ *	discrepancies between finite- and infinite-input cases.
+ */
+static float8
+NonFiniteIntervalPart(int type, int unit, char *lowunits,
+					  bool isNegative, bool isTz)
+{
+	if ((type != UNITS) && (type != RESERV))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("unit \"%s\" not recognized for type %s",
+						lowunits, format_type_be(INTERVALOID))));
+
+	switch (unit)
+	{
+			/* Oscillating units */
+		case DTK_MICROSEC:
+		case DTK_MILLISEC:
+		case DTK_SECOND:
+		case DTK_MINUTE:
+		case DTK_MONTH:
+		case DTK_QUARTER:
+			return 0.0;
+
+			/* Monotonically-increasing units */
+		case DTK_HOUR:
+		case DTK_DAY:
+		case DTK_YEAR:
+		case DTK_DECADE:
+		case DTK_CENTURY:
+		case DTK_MILLENNIUM:
+		case DTK_EPOCH:
+			if (isNegative)
+				return -get_float8_infinity();
+			else
+				return get_float8_infinity();
+
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("unit \"%s\" not supported for type %s",
+							lowunits, format_type_be(INTERVALOID))));
+			return 0.0;			/* keep compiler quiet */
+	}
+}
+
 /* interval_part() and extract_interval()
  * Extract specified field from interval.
  */
@@ -5204,6 +5637,34 @@ interval_part_common(PG_FUNCTION_ARGS, bool retnumeric)
 	type = DecodeUnits(0, lowunits, &val);
 	if (type == UNKNOWN_FIELD)
 		type = DecodeSpecial(0, lowunits, &val);
+
+	if (INTERVAL_NOT_FINITE(interval))
+	{
+		double		r = NonFiniteIntervalPart(type, val, lowunits,
+											  INTERVAL_IS_NOBEGIN(interval),
+											  false);
+
+		if (r)
+		{
+			if (retnumeric)
+			{
+				if (r < 0)
+					return DirectFunctionCall3(numeric_in,
+											   CStringGetDatum("-Infinity"),
+											   ObjectIdGetDatum(InvalidOid),
+											   Int32GetDatum(-1));
+				else if (r > 0)
+					return DirectFunctionCall3(numeric_in,
+											   CStringGetDatum("Infinity"),
+											   ObjectIdGetDatum(InvalidOid),
+											   Int32GetDatum(-1));
+			}
+			else
+				PG_RETURN_FLOAT8(r);
+		}
+		else
+			PG_RETURN_NULL();
+	}
 
 	if (type == UNITS)
 	{
@@ -5447,6 +5908,13 @@ timestamp_izone(PG_FUNCTION_ARGS)
 	if (TIMESTAMP_NOT_FINITE(timestamp))
 		PG_RETURN_TIMESTAMPTZ(timestamp);
 
+	if (INTERVAL_NOT_FINITE(zone))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("interval time zone \"%s\" must be finite",
+						DatumGetCString(DirectFunctionCall1(interval_out,
+															PointerGetDatum(zone))))));
+
 	if (zone->month != 0 || zone->day != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -5677,6 +6145,13 @@ timestamptz_izone(PG_FUNCTION_ARGS)
 	if (TIMESTAMP_NOT_FINITE(timestamp))
 		PG_RETURN_TIMESTAMP(timestamp);
 
+	if (INTERVAL_NOT_FINITE(zone))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("interval time zone \"%s\" must be finite",
+						DatumGetCString(DirectFunctionCall1(interval_out,
+															PointerGetDatum(zone))))));
+
 	if (zone->month != 0 || zone->day != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -5742,6 +6217,11 @@ generate_series_timestamp(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("step size cannot equal zero")));
+
+		if (INTERVAL_NOT_FINITE((&fctx->step)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("step size cannot be infinite")));
 
 		funcctx->user_fctx = fctx;
 		MemoryContextSwitchTo(oldcontext);
@@ -5821,6 +6301,11 @@ generate_series_timestamptz(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("step size cannot equal zero")));
+
+		if (INTERVAL_NOT_FINITE((&fctx->step)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("step size cannot be infinite")));
 
 		funcctx->user_fctx = fctx;
 		MemoryContextSwitchTo(oldcontext);
