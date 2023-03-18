@@ -254,6 +254,19 @@ pg_mul_s64_overflow(int64 a, int64 b, int64 *result)
 #endif
 }
 
+/*
+ * Add val * multiplier to *sum.
+ * Returns false if successful, true on overflow.
+ */
+static inline bool
+pg_mul_add_s64_overflow(int64 val, int64 multiplier, int64 *sum)
+{
+	int64		product;
+
+	return pg_mul_s64_overflow(val, multiplier, &product) ||
+		pg_add_s64_overflow(*sum, product, sum);
+}
+
 /*------------------------------------------------------------------------
  * Overflow routines for unsigned integers
  *------------------------------------------------------------------------
