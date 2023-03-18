@@ -3550,6 +3550,8 @@ DecodeInterval(char **field, int *ftype, int nf, int range,
 			case DTK_STRING:
 			case DTK_SPECIAL:
 				type = DecodeUnits(i, field[i], &uval);
+				if (type == UNKNOWN_FIELD)
+					type = DecodeSpecial(i, field[i], &uval);
 				if (type == IGNORE_DTF)
 					continue;
 
