@@ -1517,13 +1517,27 @@ make_interval(PG_FUNCTION_ARGS)
 				 errmsg("interval out of range")));
 
 	result = (Interval *) palloc(sizeof(Interval));
-	result->month = years * MONTHS_PER_YEAR + months;
-	result->day = weeks * 7 + days;
+	result->month = months;
+	if (pg_mul_add_s32_overflow(years, MONTHS_PER_YEAR, &result->month))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
+	result->day = days;
+	if (pg_mul_add_s32_overflow(weeks, 7, &result->day))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
 
 	secs = rint(secs * USECS_PER_SEC);
-	result->time = hours * ((int64) SECS_PER_HOUR * USECS_PER_SEC) +
-		mins * ((int64) SECS_PER_MINUTE * USECS_PER_SEC) +
-		(int64) secs;
+	result->time = secs;
+	if (pg_mul_add_s64_overflow(mins, ((int64) SECS_PER_MINUTE * USECS_PER_SEC), &result->time))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
+	if (pg_mul_add_s64_overflow(hours, ((int64) SECS_PER_HOUR * USECS_PER_SEC), &result->time))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("interval out of range")));
 
 	PG_RETURN_INTERVAL_P(result);
 }

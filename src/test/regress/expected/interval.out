@@ -1587,6 +1587,11 @@ select interval '-2147483648 months -2147483648 days -9223372036854775808 micros
 ERROR:  interval field value out of range: "-2147483648 months -2147483648 days -9223372036854775808 microseconds ago"
 LINE 1: select interval '-2147483648 months -2147483648 days -922337...
                         ^
+-- overflowing using make_interval
+select make_interval(1, 2147483647, 2147483647, 1, 1, 1, 9223372036854.7759);
+ERROR:  interval out of range
+select make_interval(-1, -2147483648, -2147483648, -1, -1, -1, -9223372036854.7759);
+ERROR:  interval out of range
 -- test that INT_MIN number is formatted properly
 SET IntervalStyle to postgres;
 select interval '-2147483648 months -2147483648 days -9223372036854775808 us';

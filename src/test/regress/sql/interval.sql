@@ -511,6 +511,10 @@ select interval '-2147483648 days ago';
 select interval '-9223372036854775808 microseconds ago';
 select interval '-2147483648 months -2147483648 days -9223372036854775808 microseconds ago';
 
+-- overflowing using make_interval
+select make_interval(1, 2147483647, 2147483647, 1, 1, 1, 9223372036854.7759);
+select make_interval(-1, -2147483648, -2147483648, -1, -1, -1, -9223372036854.7759);
+
 -- test that INT_MIN number is formatted properly
 SET IntervalStyle to postgres;
 select interval '-2147483648 months -2147483648 days -9223372036854775808 us';
